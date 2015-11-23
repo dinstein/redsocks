@@ -224,6 +224,15 @@ static void auto_recv_timeout_cb(evutil_socket_t fd, short events, void * arg)
     assert(events & EV_TIMEOUT);
 
     redsocks_touch_client(client);
+
+    // In case RECV timeout occurs, try to connect to target via configured proxy.
+    if (aclient->state == AUTOPROXY_CONNECTED
+        && (aclient->data_sent && !aclient->data_recv))
+    {
+        if (!auto_retry_or_drop(client))
+            return;
+    }
+
     // Let's make connection confirmed
     if (aclient->state == AUTOPROXY_CONNECTED)
         auto_confirm_connection(client);
