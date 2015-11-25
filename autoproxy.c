@@ -331,8 +331,10 @@ static int handle_write_to_relay(redsocks_client *client)
                 if (aclient->recv_timer_event)
                 {
                     struct timeval tv;
-                    tv.tv_sec = 0;
-                    tv.tv_usec = 600000;
+                    tv.tv_sec = client->instance->config.timeout;
+                    tv.tv_usec = 0;
+                    if (tv.tv_sec == 0)
+                        tv.tv_sec = DEFAULT_CONNECT_TIMEOUT;
                     if (-1 == evtimer_add(aclient->recv_timer_event, &tv))
                     {
                         redsocks_log_error(client, LOG_DEBUG, "Failed to add timer!");
