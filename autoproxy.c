@@ -51,6 +51,7 @@ typedef struct autoproxy_client_t {
 
 void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int how);
 void redsocks_event_error(struct bufferevent *buffev, short what, void *_arg);
+static int auto_retry(redsocks_client * client, int updcache);
 static int auto_retry_or_drop(redsocks_client * client);
 static void direct_relay_clientreadcb(struct bufferevent *from, void *_client);
 static void auto_event_error(struct bufferevent *buffev, short what, void *_arg);
