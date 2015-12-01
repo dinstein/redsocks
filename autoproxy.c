@@ -229,8 +229,9 @@ static void auto_recv_timeout_cb(evutil_socket_t fd, short events, void * arg)
     if (aclient->state == AUTOPROXY_CONNECTED
         && (aclient->data_sent && !aclient->data_recv))
     {
-        if (!auto_retry_or_drop(client))
-            return;
+        on_connection_blocked(client);  
+        auto_retry(client, 1);
+        return;
     }
 
     // Let's make connection confirmed
