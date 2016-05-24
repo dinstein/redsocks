@@ -44,6 +44,19 @@ static int tcpdns_fini();
 #define DNS_QR 0x80
 #define DNS_TC 0x02
 #define DNS_Z  0x70
+#define DNS_RC_MASK      0x0F
+
+#define DNS_RC_NOERROR   0
+#define DNS_RC_FORMERR   1
+#define DNS_RC_SERVFAIL  2
+#define DNS_RC_NXDOMAIN  3
+#define DNS_RC_NOTIMP    4
+#define DNS_RC_REFUSED   5
+#define DNS_RC_YXDOMAIN  6
+#define DNS_RC_XRRSET    7
+#define DNS_RC_NOTAUTH   8
+#define DNS_RC_NOTZONE   9
+
 #define DEFAULT_TIMEOUT_SECONDS 4
 
 #define FLAG_TCP_TEST 0x01
@@ -52,9 +65,7 @@ static int tcpdns_fini();
 typedef enum tcpdns_state_t {
     STATE_NEW,
     STATE_REQUEST_SENT,
-    STATE_RECV_RESPONSE,
     STATE_RESPONSE_SENT,
-    STATE_CONNECTION_TIMEOUT,
 } tcpdns_state;
 
 
@@ -63,20 +74,23 @@ typedef enum tcpdns_state_t {
  */
 static void tcpdns_drop_request(dns_request * req)
 {
-    tcpdns_log_error(LOG_DEBUG, "dropping request");
+    int fd;
+    tcpdns_log_error(LOG_DEBUG, "dropping request @ state: %d", req->state);
     if (req->resolver)
     {
-        close(bufferevent_getfd(req->resolver)); 
+        fd = bufferevent_getfd(req->resolver);
         bufferevent_free(req->resolver);
-    }
-
-    if (req->delay && req->state != STATE_RESPONSE_SENT)
-    {
-        * req->delay = req->state == STATE_CONNECTION_TIMEOUT ? -1 : 0; 
+        close(fd);
     }
 
     list_del(&req->list);
     free(req);
+}
+
+static inline void tcpdns_update_delay(dns_request * req, int delay)
+{
+    if (req->delay)
+        * req->delay = delay;
 }
 
 static void tcpdns_readcb(struct bufferevent *from, void *_arg)
@@ -104,18 +118,30 @@ static void tcpdns_readcb(struct bufferevent *from, void *_arg)
         // FIXME:
         // suppose we got all data in one read 
         read_size = bufferevent_read(from, &buff, sizeof(buff));
-        if (read_size > 2)
+        if (read_size > (2 + sizeof(dns_header)))
         {
-            int fd = EVENT_FD(&req->instance->listener);
-            sendto(fd, &buff.raw[2], ntohs(buff.len), 0,
-                  (struct sockaddr*)&req->client_addr, sizeof(req->client_addr));
-            req->state = STATE_RESPONSE_SENT;
-            // calculate and update DNS resolver's delay
-            if (req->delay)
-            {
-                gettimeofday(&tv, 0);
-                timersub(&tv, &req->req_time, &tv);
-                * req->delay = tv.tv_sec*1000+tv.tv_usec/1000;
+            dns_header * dh = (dns_header *)&buff.raw[2]; 
+            switch (dh->ra_z_rcode & DNS_RC_MASK) {
+                case DNS_RC_NOERROR:
+                case DNS_RC_FORMERR:
+                case DNS_RC_NXDOMAIN:
+                    {
+                        int fd = event_get_fd(&req->instance->listener);
+                        if (sendto(fd, &buff.raw[2], read_size - 2, 0,
+                                (struct sockaddr*)&req->client_addr,
+                                sizeof(req->client_addr)) != read_size - 2) {
+                            tcpdns_log_errno(LOG_ERR, "sendto");
+                        }
+                        req->state = STATE_RESPONSE_SENT;
+                        // calculate and update DNS resolver's delay
+                        gettimeofday(&tv, 0);
+                        timersub(&tv, &req->req_time, &tv);
+                        tcpdns_update_delay(req, tv.tv_sec*1000+tv.tv_usec/1000);
+                    }
+                    break;
+                default:
+                    // panalize server
+                    tcpdns_update_delay(req, (req->instance->config.timeout + 1) * 1000);
             }
         }
     }
@@ -128,7 +154,7 @@ static void tcpdns_connected(struct bufferevent *buffev, void *_arg)
 {
     dns_request * req = _arg;
     assert(buffev == req->resolver);
-    struct timeval tv;    
+    struct timeval tv, tv2;
 
     if (!red_is_socket_connected_ok(buffev)) 
     {
@@ -138,6 +164,7 @@ static void tcpdns_connected(struct bufferevent *buffev, void *_arg)
     }
 
     if (req->state != STATE_NEW)
+        // Nothing to write
         return;
 
     // Write dns request to DNS resolver and shutdown connection
@@ -145,7 +172,7 @@ static void tcpdns_connected(struct bufferevent *buffev, void *_arg)
     if (bufferevent_write(buffev, &len, sizeof(uint16_t)) == -1
         || bufferevent_write(buffev, &req->data.raw, req->data_len) == -1)
     {
-        tcpdns_log_errno(LOG_ERR, "bufferevent_write_buffer");
+        tcpdns_log_errno(LOG_ERR, "bufferevent_write");
         tcpdns_drop_request(req);
         return;
     }
@@ -153,9 +180,19 @@ static void tcpdns_connected(struct bufferevent *buffev, void *_arg)
     // Set timeout for read with time left since connection setup.
     gettimeofday(&tv, 0);
     timersub(&tv, &req->req_time, &tv);
-    bufferevent_set_timeouts(buffev, &tv, NULL);
-    bufferevent_enable(buffev, EV_READ);
-    req->state = STATE_REQUEST_SENT;
+    tv2.tv_sec = req->instance->config.timeout;
+    tv2.tv_usec = 0;
+    timersub(&tv2, &tv, &tv);
+    if (tv.tv_sec > 0 || tv.tv_usec > 0) {
+        bufferevent_set_timeouts(buffev, &tv, NULL);
+        // Allow reading response
+        bufferevent_enable(buffev, EV_READ);
+        req->state = STATE_REQUEST_SENT;
+    }
+    else {
+        tcpdns_update_delay(req, tv2.tv_sec * 1000);
+        tcpdns_drop_request(req);
+    }
 }
 
 
@@ -171,7 +208,11 @@ static void tcpdns_event_error(struct bufferevent *buffev, short what, void *_ar
     if (req->state == STATE_NEW 
         && what == (BEV_EVENT_WRITING | BEV_EVENT_TIMEOUT))
     {
-        req->state = STATE_CONNECTION_TIMEOUT;
+        tcpdns_update_delay(req, -1);
+    }
+    else if (saved_errno == ECONNRESET) {
+        // If connect is reset, try to not use this DNS server next time.
+        tcpdns_update_delay(req, (req->instance->config.timeout + 1) * 1000);
     }
     tcpdns_drop_request(req);
 }
@@ -235,12 +276,12 @@ static void tcpdns_pkt_from_client(int fd, short what, void *_arg)
     struct sockaddr_in * destaddr;
     ssize_t pktlen;
 
-    assert(fd == EVENT_FD(&self->listener));
+    assert(fd == event_get_fd(&self->listener));
     /* allocate and initialize request structure */
     req = (dns_request *)calloc(sizeof(dns_request), 1);
     if (!req)
     {
-        log_error(LOG_INFO, "Out of memeory.");
+        log_error(LOG_ERR, "Out of memeory.");
         return;
     }
     req->instance = self;
@@ -248,10 +289,14 @@ static void tcpdns_pkt_from_client(int fd, short what, void *_arg)
     gettimeofday(&req->req_time, 0);
     pktlen = red_recv_udp_pkt(fd, req->data.raw, sizeof(req->data.raw), &req->client_addr, NULL);
     if (pktlen == -1)
+    {
+        free(req);
         return;
+    }
     if (pktlen <= sizeof(dns_header)) 
     {
         tcpdns_log_error(LOG_INFO, "incomplete DNS request");
+        free(req);
         return;
     }
     req->data_len = pktlen;
@@ -262,16 +307,14 @@ static void tcpdns_pkt_from_client(int fd, short what, void *_arg)
         && !req->data.header.ancount && !req->data.header.nscount && !req->data.header.arcount /* no answers */
     ) 
     {
-        tv.tv_sec = DEFAULT_TIMEOUT_SECONDS;
+        tv.tv_sec = self->config.timeout;
         tv.tv_usec = 0;
-        if (self->config.timeout>0)
-            tv.tv_sec = self->config.timeout;
 
         destaddr = choose_tcpdns(self, &req->delay);
         if (!destaddr)
         {
+            tcpdns_log_error(LOG_WARNING, "No valid DNS resolver configured");
             free(req);
-            tcpdns_log_error(LOG_INFO, "No valid DNS resolver configured");
             return;
         }
         /* connect to target directly without going through proxy */
@@ -282,14 +325,14 @@ static void tcpdns_pkt_from_client(int fd, short what, void *_arg)
             list_add(&req->list, &self->requests);
         else
         {
-            free(req);
             tcpdns_log_error(LOG_INFO, "Failed to setup connection to DNS resolver");
+            free(req);
         }
     }
     else
     {
-        free(req);
         tcpdns_log_error(LOG_INFO, "malformed DNS request");
+        free(req);
     }
 }
 
@@ -384,10 +427,12 @@ static int tcpdns_onexit(parser_section *section)
         err = "At least one TCP DNS resolver must be configured.";
 
     if (err)
-        parser_error(section->context, err);
+        parser_error(section->context, "%s", err);
     else
         list_add(&instance->list, &instances);
-
+    // If timeout is not configured or is configured as zero, use default timeout.
+    if (instance->config.timeout == 0)
+        instance->config.timeout = DEFAULT_TIMEOUT_SECONDS;
     return err ? -1 : 0;
 }
 
@@ -399,8 +444,9 @@ static int tcpdns_init_instance(tcpdns_instance *instance)
      */
     int error;
     int fd = -1;
+    char buf1[RED_INET_ADDRSTRLEN];
 
-    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd == -1) {
         log_errno(LOG_ERR, "socket");
         goto fail;
@@ -426,15 +472,15 @@ static int tcpdns_init_instance(tcpdns_instance *instance)
         goto fail;
     }
 
+    log_error(LOG_INFO, "tcpdns @ %s",
+        red_inet_ntop(&instance->config.bindaddr, buf1, sizeof(buf1)));
     return 0;
 
 fail:
     tcpdns_fini_instance(instance);
 
-    if (fd != -1) {
-        if (close(fd) != 0)
-            log_errno(LOG_WARNING, "close");
-    }
+    if (fd != -1 && close(fd) != 0)
+        log_errno(LOG_WARNING, "close");
 
     return -1;
 }
@@ -447,9 +493,8 @@ static void tcpdns_fini_instance(tcpdns_instance *instance)
     if (event_initialized(&instance->listener)) {
         if (event_del(&instance->listener) != 0)
             log_errno(LOG_WARNING, "event_del");
-        if (close(EVENT_FD(&instance->listener)) != 0)
+        if (close(event_get_fd(&instance->listener)) != 0)
             log_errno(LOG_WARNING, "close");
-        memset(&instance->listener, 0, sizeof(instance->listener));
     }
 
     list_del(&instance->list);
@@ -461,8 +506,6 @@ static void tcpdns_fini_instance(tcpdns_instance *instance)
 static int tcpdns_init()
 {
     tcpdns_instance *tmp, *instance = NULL;
-
-    // TODO: init debug_dumper
 
     list_for_each_entry_safe(instance, tmp, &instances, list) {
         if (tcpdns_init_instance(instance) != 0)
@@ -486,6 +529,30 @@ static int tcpdns_fini()
     return 0;
 }
 
+static void tcpdns_dump_instance(tcpdns_instance *instance)
+{
+    char buf1[RED_INET_ADDRSTRLEN];
+
+    log_error(LOG_INFO, "Dumping data for instance (tcpdns @ %s):",
+                        red_inet_ntop(&instance->config.bindaddr, buf1, sizeof(buf1)));
+    log_error(LOG_INFO, "Delay of TCP DNS [%s]: %dms",
+                        red_inet_ntop(&instance->config.tcpdns1_addr, buf1, sizeof(buf1)),
+                        instance->tcp1_delay_ms);
+    log_error(LOG_INFO, "Delay of TCP DNS [%s]: %dms",
+                        red_inet_ntop(&instance->config.tcpdns2_addr, buf1, sizeof(buf1)),
+                        instance->tcp2_delay_ms);
+    log_error(LOG_INFO, "End of data dumping.");
+}
+
+
+static void tcpdns_debug_dump()
+{
+    tcpdns_instance *instance = NULL;
+
+    list_for_each_entry(instance, &instances, list)
+        tcpdns_dump_instance(instance);
+}
+
 static parser_section tcpdns_conf_section =
 {
     .name    = "tcpdns",
@@ -498,6 +565,7 @@ app_subsys tcpdns_subsys =
 {
     .init = tcpdns_init,
     .fini = tcpdns_fini,
+    .dump = tcpdns_debug_dump,
     .conf_section = &tcpdns_conf_section,
 };
 

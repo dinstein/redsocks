@@ -41,29 +41,27 @@ typedef enum autoproxy_state_t {
 
 typedef struct autoproxy_client_t {
     autoproxy_state state;
-    time_t time_connect_relay; // timestamp when start to connect relay
     size_t data_recv;
     size_t data_sent;
     struct event * recv_timer_event;
-    int    quick_check; // flag indicating quick check initiated.
+    short  quick_check; // flag indicating quick check initiated.
 } autoproxy_client;
 
 
-void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int how);
 void redsocks_event_error(struct bufferevent *buffev, short what, void *_arg);
 static int auto_retry(redsocks_client * client, int updcache);
 static int auto_retry_or_drop(redsocks_client * client);
 static void direct_relay_clientreadcb(struct bufferevent *from, void *_client);
 static void auto_event_error(struct bufferevent *buffev, short what, void *_arg);
 
-#define QUICK_CONNECT_TIMEOUT_SECONDS 3 
-#define NO_CHECK_SECONDS 60 
+#define QUICK_CONNECT_TIMEOUT_SECONDS 3
+#define NO_CHECK_SECONDS 60
 
 
 typedef struct autoproxy_config_t {
     list_head  list; // Make it a list to support multiple configurations
-    int    quick_connect_timeout;
-    int    no_quick_check_seconds;
+    uint16_t   quick_connect_timeout;
+    uint16_t   no_quick_check_seconds;
 } autoproxy_config;
 
 static autoproxy_config default_config = {
@@ -97,7 +95,7 @@ static int autoproxy_onenter(parser_section *section)
             (strcmp(entry->key, "quick_connect_timeout") == 0) ? (void*)&config->quick_connect_timeout:
             (strcmp(entry->key, "no_quick_check_seconds") == 0) ? (void*)&config->no_quick_check_seconds:
             NULL;
-    section->data = config; 
+    section->data = config;
     return 0;
 }
 
@@ -119,7 +117,7 @@ static int autoproxy_onexit(parser_section *section)
         err = "Timeout value for quick check can not be 0. Default: 3";
 
     if (err)
-        parser_error(section->context, err);
+        parser_error(section->context, "%s", err);
     else
         // Add config to config list
         list_add(&config->list, &configs);
@@ -161,7 +159,18 @@ static autoproxy_config * get_config(redsocks_client * client)
     }
 }
 
-#define get_autoproxy_client(client) (void*)(client + 1) + client->instance->relay_ss->payload_len;
+#define get_autoproxy_client(client) ((void*)(client + 1) + client->instance->relay_ss->payload_len)
+
+static void auto_release_recv_timer(autoproxy_client * aclient)
+{
+    // Cancel timer and release event object for timer
+    if (aclient->recv_timer_event)
+    {
+        event_del(aclient->recv_timer_event);
+        event_free(aclient->recv_timer_event);
+        aclient->recv_timer_event = NULL;
+    }
+}
 
 static void auto_client_init(redsocks_client *client)
 {
@@ -174,25 +183,19 @@ static void auto_client_init(redsocks_client *client)
 static void auto_client_fini(redsocks_client *client)
 {
     autoproxy_client * aclient = get_autoproxy_client(client);
-
-    if (aclient->recv_timer_event)
-    {
-        event_del(aclient->recv_timer_event);
-        event_free(aclient->recv_timer_event);
-        aclient->recv_timer_event = NULL;
-    }
+    auto_release_recv_timer(aclient);
 }
 
 static void on_connection_confirmed(redsocks_client *client)
 {
-    redsocks_log_error(client, LOG_DEBUG, "IP Confirmed"); 
+    redsocks_log_error(client, LOG_DEBUG, "IP Confirmed");
 
     cache_del_addr(&client->destaddr);
 }
 
 static void on_connection_blocked(redsocks_client *client)
 {
-    redsocks_log_error(client, LOG_DEBUG, "IP Blocked"); 
+    redsocks_log_error(client, LOG_DEBUG, "IP Blocked");
 }
 
 static void auto_confirm_connection(redsocks_client * client)
@@ -206,13 +209,7 @@ static void auto_confirm_connection(redsocks_client * client)
         evbuffer_drain(bufferevent_get_input(client->client), aclient->data_sent);
         aclient->data_sent = 0;
     }
-    // Cancel timer and release event object for timer
-    if (aclient->recv_timer_event)
-    {
-        event_del(aclient->recv_timer_event);
-        event_free(aclient->recv_timer_event);
-        aclient->recv_timer_event = NULL;
-    }
+    auto_release_recv_timer(aclient);
     on_connection_confirmed(client);
 }
 
@@ -221,7 +218,7 @@ static void auto_recv_timeout_cb(evutil_socket_t fd, short events, void * arg)
     redsocks_client *client = arg;
     autoproxy_client * aclient = get_autoproxy_client(client);
 
-    redsocks_log_error(client, LOG_DEBUG, "RECV Timeout, state: %d, data_sent: %u", aclient->state, aclient->data_sent); 
+    redsocks_log_error(client, LOG_DEBUG, "RECV Timeout, state: %d, data_sent: %u", aclient->state, aclient->data_sent);
     assert(events & EV_TIMEOUT);
 
     redsocks_touch_client(client);
@@ -230,7 +227,7 @@ static void auto_recv_timeout_cb(evutil_socket_t fd, short events, void * arg)
     if (aclient->state == AUTOPROXY_CONNECTED
         && (aclient->data_sent && !aclient->data_recv))
     {
-        on_connection_blocked(client);  
+        on_connection_blocked(client);
         auto_retry(client, 1);
         return;
     }
@@ -296,21 +293,21 @@ static int handle_write_to_relay(redsocks_client *client)
                 return 1;
             }
         }
-        /* 
+        /*
          * Relay reaceived data before writing to relay.
         */
         else if (!aclient->data_sent && aclient->data_recv)
         {
-            // TODO: 
+            // TODO:
             // In case we receive data before sending any data,
             // should we confirm connection immediately or after
             // sending data?
             //aclient->data_sent = copy_evbuffer(to, from, 0);
             auto_confirm_connection(client);
-             
+
         }
         /* aclient->state = AUTOPROXY_CONFIRMED; */
-        /* We have writen data to relay, but got nothing until we are requested to 
+        /* We have writen data to relay, but got nothing until we are requested to
         * write to it again.
         */
         else if (aclient->data_sent && !aclient->data_recv)
@@ -327,7 +324,7 @@ static int handle_write_to_relay(redsocks_client *client)
             else if (output_size < aclient->data_sent /*  data is sent out, more or less */
                 && input_size == aclient->data_sent /* all data in read buffer is sent */
                 && !aclient->recv_timer_event /* timer is not activated yet */
-                ) 
+                )
             {
                 aclient->recv_timer_event = evtimer_new(bufferevent_get_base(to), auto_recv_timeout_cb, client);
                 if (aclient->recv_timer_event)
@@ -340,7 +337,7 @@ static int handle_write_to_relay(redsocks_client *client)
                     if (-1 == evtimer_add(aclient->recv_timer_event, &tv))
                     {
                         redsocks_log_error(client, LOG_DEBUG, "Failed to add timer!");
-                        // In case we failed to add timer, it is abnormal. 
+                        // In case we failed to add timer, it is abnormal.
                         // Let's confirm the connection directly so that normal service is not
                         // impacted.
                         auto_confirm_connection(client);
@@ -385,7 +382,7 @@ static void direct_relay_clientreadcb(struct bufferevent *from, void *_client)
     redsocks_client *client = _client;
     size_t input_size = evbuffer_get_length(bufferevent_get_input(from));
 
-    redsocks_log_error(client, LOG_DEBUG, "client in: %u", input_size); 
+    redsocks_log_error(client, LOG_DEBUG, "client in: %u", input_size);
     redsocks_touch_client(client);
     if (handle_write_to_relay(client))
         return;
@@ -398,7 +395,7 @@ static void direct_relay_relayreadcb(struct bufferevent *from, void *_client)
     redsocks_client *client = _client;
     size_t input_size = evbuffer_get_length(bufferevent_get_input(from));
 
-    redsocks_log_error(client, LOG_DEBUG, "relay in: %u", input_size); 
+    redsocks_log_error(client, LOG_DEBUG, "relay in: %u", input_size);
     redsocks_touch_client(client);
     if (handle_write_to_client(client))
         return;
@@ -416,7 +413,7 @@ static void direct_relay_clientwritecb(struct bufferevent *to, void *_client)
         return;
     if (handle_write_to_client(client))
         return;
-    if (output_size < to->wm_write.high) 
+    if (output_size < to->wm_write.high)
     {
         if (bufferevent_write_buffer(to, bufferevent_get_input(from)) == -1)
             redsocks_log_errno(client, LOG_ERR, "bufferevent_write_buffer");
@@ -445,7 +442,7 @@ static int process_shutdown_on_write_2(redsocks_client *client, struct buffereve
         if (input_size == 0
             || (input_size == aclient->data_sent && aclient->state == AUTOPROXY_CONNECTED))
         {
-            redsocks_shutdown(client, to, SHUT_WR);
+            redsocks_shutdown(client, to, SHUT_WR, 0);
             return 1;
         }
     }
@@ -468,13 +465,13 @@ static void direct_relay_relaywritecb(struct bufferevent *to, void *_client)
         return;
     if (aclient->state == AUTOPROXY_CONFIRMED)
     {
-        if (output_size < to->wm_write.high) 
+        if (output_size < to->wm_write.high)
         {
             if (bufferevent_write_buffer(to, bufferevent_get_input(from)) == -1)
                 redsocks_log_errno(client, LOG_ERR, "bufferevent_write_buffer");
             if (!(client->client_evshut & EV_READ) && bufferevent_enable(from, EV_READ) == -1)
                 redsocks_log_errno(client, LOG_ERR, "bufferevent_enable");
-        }   
+        }
     }
 }
 
@@ -485,10 +482,12 @@ static void auto_drop_relay(redsocks_client *client)
     {
         redsocks_log_error(client, LOG_DEBUG, "dropping relay only ");
         fd = bufferevent_getfd(client->relay);
+        bufferevent_disable(client->relay, EV_READ|EV_WRITE);
         bufferevent_free(client->relay);
         redsocks_close(fd);
         client->relay = NULL;
     }
+    client->relay_evshut = 0;
     client->relay_connected = 0;
 }
 
@@ -498,7 +497,7 @@ static int auto_retry(redsocks_client * client, int updcache)
     int rc;
 
     if (aclient->state == AUTOPROXY_CONNECTED)
-        bufferevent_disable(client->client, EV_READ| EV_WRITE); 
+        bufferevent_disable(client->client, EV_READ| EV_WRITE);
     /* drop relay and update state, then retry with specified relay */
     if (updcache)
     {
@@ -506,25 +505,18 @@ static int auto_retry(redsocks_client * client, int updcache)
         if (cache_get_addr_time(&client->destaddr) == NULL)
         {
             cache_add_addr(&client->destaddr);
-            redsocks_log_error(client, LOG_DEBUG, "ADD IP to cache: %s", 
+            redsocks_log_error(client, LOG_DEBUG, "ADD IP to cache: %s",
                             inet_ntoa(client->destaddr.sin_addr));
         }
     }
-    // Release timer
-    if (aclient->recv_timer_event)
-    {
-        event_del(aclient->recv_timer_event);
-        event_free(aclient->recv_timer_event);
-        aclient->recv_timer_event = NULL;
-    }
 
+    auto_release_recv_timer(aclient);
     auto_drop_relay(client);
-
     // restore callbacks for ordinary client.
     bufferevent_setcb(client->client, NULL, NULL, redsocks_event_error, client);
     // enable reading to handle EOF from client
     if (!(client->client_evshut & EV_READ))
-        bufferevent_enable(client->client, EV_READ); 
+        bufferevent_enable(client->client, EV_READ);
 
     /* connect to relay */
     if (client->instance->relay_ss->connect_relay)
@@ -549,12 +541,11 @@ static int auto_retry(redsocks_client * client, int updcache)
 static int auto_retry_or_drop(redsocks_client * client)
 {
     autoproxy_client * aclient = get_autoproxy_client(client);
-    
+
     if (aclient->state == AUTOPROXY_NEW || aclient->state == AUTOPROXY_CONNECTED)
     {
-        on_connection_blocked(client);  
-        auto_retry(client, 0);
-        return 0; 
+        on_connection_blocked(client);
+        return auto_retry(client, 0);
     }
     /* drop */
     return 1;
@@ -564,21 +555,21 @@ static void auto_relay_connected(struct bufferevent *buffev, void *_arg)
 {
     redsocks_client *client = _arg;
     autoproxy_client * aclient = get_autoproxy_client(client);
-    
+
     assert(buffev == client->relay);
-        
+
     redsocks_touch_client(client);
 
     if (!red_is_socket_connected_ok(buffev)) {
         if (aclient->state == AUTOPROXY_NEW && !auto_retry_or_drop(client))
             return;
-            
+
         redsocks_log_error(client, LOG_DEBUG, "failed to connect to destination");
         redsocks_drop_client(client);
         return;
     }
 
-    /* update client state */   
+    /* update client state */
     aclient->state = AUTOPROXY_CONNECTED;
     client->relay_connected = 1;
 
@@ -586,24 +577,18 @@ static void auto_relay_connected(struct bufferevent *buffev, void *_arg)
     The two peers will handle it. */
     bufferevent_set_timeouts(client->relay, NULL, NULL);
 
-    if (!redsocks_start_relay(client))
-    {
-        /* overwrite theread callback to my function */
-        bufferevent_setcb(client->client, direct_relay_clientreadcb,
-                                         direct_relay_clientwritecb,
-                                         auto_event_error,
-                                         client);
-        bufferevent_setcb(client->relay, direct_relay_relayreadcb,
-                                         direct_relay_relaywritecb,
-                                         auto_event_error,
-                                         client);
-    }
-    else
-    {
-        redsocks_log_error(client, LOG_DEBUG, "failed to start relay");
-        redsocks_drop_client(client);
+    if (redsocks_start_relay(client))
+        // redsocks_start_relay() drops client on failure
         return;
-    }
+    /* overwrite theread callback to my function */
+    bufferevent_setcb(client->client, direct_relay_clientreadcb,
+                                     direct_relay_clientwritecb,
+                                     auto_event_error,
+                                     client);
+    bufferevent_setcb(client->relay, direct_relay_relayreadcb,
+                                     direct_relay_relaywritecb,
+                                     auto_event_error,
+                                     client);
     // Write any data received from client side to relay.
     if (evbuffer_get_length(bufferevent_get_input(client->client)))
         direct_relay_relaywritecb(client->relay, client);
@@ -623,29 +608,29 @@ static void auto_event_error(struct bufferevent *buffev, short what, void *_arg)
 
     if (!(what & BEV_EVENT_ERROR))
         errno = red_socket_geterrno(buffev);
-    redsocks_log_errno(client, LOG_DEBUG, "%s, errno(%d), State: %d, what: " event_fmt_str, 
+    redsocks_log_errno(client, LOG_DEBUG, "%s, errno(%d), State: %d, what: " event_fmt_str,
                             buffev == client->client?"client":"relay",
                             errno, aclient->state, event_fmt(what));
     if (buffev == client->relay)
     {
 /*
-        if (what & BEV_EVENT_CONNECTED) 
+        if (what & BEV_EVENT_CONNECTED)
         {
             auto_relay_connected(buffev, _arg);
             return;
         }
 */
-        if ( aclient->state == AUTOPROXY_NEW 
+        if ( aclient->state == AUTOPROXY_NEW
         && what == (BEV_EVENT_WRITING | BEV_EVENT_TIMEOUT))
         {
             // Update access time for IP fails again.
             if (aclient->quick_check)
                 cache_touch_addr(&client->destaddr);
 
-            on_connection_blocked(client);  
+            on_connection_blocked(client);
             /* In case timeout occurs while connecting relay, we try to connect
             to target via configured proxy. It is possible that the connection to
-            target can be set up a bit longer than the timeout value we set. 
+            target can be set up a bit longer than the timeout value we set.
             However, it is still better to make connection via proxy. */
             auto_retry(client, 1);
             return;
@@ -656,7 +641,7 @@ static void auto_event_error(struct bufferevent *buffev, short what, void *_arg)
                 return;
 
         if (aclient->state == AUTOPROXY_CONNECTED
-                && what == (BEV_EVENT_READING|BEV_EVENT_ERROR) 
+                && what == (BEV_EVENT_READING|BEV_EVENT_ERROR)
                 /* No matter it is disconnected due to Connection Reset or any
                 other reason, we still have a chance to forward connection via
                  proxy. I prefer retry only if we got connection reset.
@@ -666,7 +651,7 @@ static void auto_event_error(struct bufferevent *buffev, short what, void *_arg)
             if (!auto_retry_or_drop(client))
                 return;
         }
-    }   
+    }
 
     if (what == (BEV_EVENT_READING|BEV_EVENT_EOF))
     {
@@ -678,7 +663,7 @@ static void auto_event_error(struct bufferevent *buffev, short what, void *_arg)
         if (aclient->recv_timer_event && buffev == client->relay)
             auto_confirm_connection(client);
 
-        redsocks_shutdown(client, buffev, SHUT_RD);
+        redsocks_shutdown(client, buffev, SHUT_RD, 1);
         // Ensure the other party could send remaining data and SHUT_WR also
         if (buffev == client->client)
         {
@@ -695,7 +680,7 @@ static void auto_event_error(struct bufferevent *buffev, short what, void *_arg)
     {
         redsocks_drop_client(client);
     }
-}                                                                       
+}
 
 
 static int auto_connect_relay(redsocks_client *client)
@@ -706,12 +691,8 @@ static int auto_connect_relay(redsocks_client *client)
     tv.tv_sec = client->instance->config.timeout;
     tv.tv_usec = 0;
     time_t * acc_time = NULL;
-    time_t now = redsocks_time(NULL);   
+    time_t now = redsocks_time(NULL);
 
-    /* use default timeout if timeout is not configured */
-    if (tv.tv_sec == 0)
-        tv.tv_sec = DEFAULT_CONNECT_TIMEOUT; 
-    
     if (aclient->state == AUTOPROXY_NEW)
     {
         acc_time = cache_get_addr_time(&client->destaddr);
@@ -719,7 +700,7 @@ static int auto_connect_relay(redsocks_client *client)
         {
             redsocks_log_error(client, LOG_DEBUG, "Found dest IP in cache");
             config = get_config(client);
-            // No quick check when the time passed since IP is added to cache is 
+            // No quick check when the time passed since IP is added to cache is
             // less than NO_CHECK_SECONDS. Just let it go via proxy.
             if (config->no_quick_check_seconds == 0
               || now - *acc_time < config->no_quick_check_seconds)
@@ -728,22 +709,20 @@ static int auto_connect_relay(redsocks_client *client)
              * Sometimes, good sites are added into cache due to occasionally
              * connection timeout. It is annoying. So, decision is made to
              * always try to connect to destination first when the destination
-             * is found in cache. 
+             * is found in cache.
              * For most destinations, the connection could be set up correctly
              * in short time. And, for most blocked sites, we get connection
              * reset almost immediately when connection is set up or when HTTP
-             * request is sent. 
+             * request is sent.
              */
             tv.tv_sec = config->quick_connect_timeout;
             aclient->quick_check = 1;
         }
-        /* connect to target directly without going through proxy */    
+        /* connect to target directly without going through proxy */
         client->relay = red_connect_relay2(&client->destaddr,
-                        NULL, auto_relay_connected, auto_event_error, client, 
+                        NULL, auto_relay_connected, auto_event_error, client,
                         &tv);
-    
-        aclient->time_connect_relay = redsocks_time(NULL);
-           
+
         if (!client->relay) {
             redsocks_log_errno(client, LOG_ERR, "auto_connect_relay");
             redsocks_drop_client(client);
@@ -758,7 +737,7 @@ static int auto_connect_relay(redsocks_client *client)
     }
     return 0;
 }
-                                                    
+
 
 relay_subsys autoproxy_subsys =
 {

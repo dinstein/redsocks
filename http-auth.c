@@ -32,15 +32,15 @@ char* basic_authentication_encode(const char *user, const char *passwd)
 {
 	/* prepare the user:pass key pair */
 	int pair_len = strlen(user) + 1 + strlen(passwd);
-	char *pair_ptr = calloc(pair_len + 1, 1);
+	char pair[pair_len + 1];
 
-	sprintf(pair_ptr, "%s:%s", user, passwd);
+	sprintf(pair, "%s:%s", user, passwd);
 
 	/* calculate the final string length */
 	int basic_len = BASE64_SIZE(pair_len);
 	char *basic_ptr = calloc(basic_len + 1, 1);
 
-	if (!base64_encode(basic_ptr, basic_len, (const uint8_t*)pair_ptr, pair_len))
+	if (!base64_encode(basic_ptr, basic_len, (const uint8_t*)pair, pair_len))
 		return NULL;
 
 	return basic_ptr;
@@ -191,7 +191,7 @@ char* digest_authentication_encode(const char *line, const char *user, const cha
 	char response[MD5_HASHLEN * 2 + 1];
 
 	/* A1 = username-value ":" realm-value ":" passwd */
-	md5_init(&ctx);
+	md5_init_rs(&ctx);
 	md5_append(&ctx, (md5_byte_t*)user, strlen(user));
 	md5_append(&ctx, (md5_byte_t*)":", 1);
 	md5_append(&ctx, (md5_byte_t*)realm, strlen(realm));
@@ -201,7 +201,7 @@ char* digest_authentication_encode(const char *line, const char *user, const cha
 	dump_hash(a1buf, hash);
 
 	/* A2 = Method ":" digest-uri-value */
-	md5_init(&ctx);
+	md5_init_rs(&ctx);
 	md5_append(&ctx, (md5_byte_t*)method, strlen(method));
 	md5_append(&ctx, (md5_byte_t*)":", 1);
 	md5_append(&ctx, (md5_byte_t*)path, strlen(path));
@@ -210,7 +210,7 @@ char* digest_authentication_encode(const char *line, const char *user, const cha
 
 	/* qop set: request-digest = H(A1) ":" nonce-value ":" nc-value ":" cnonce-value ":" qop-value ":" H(A2) */
 	/* not set: request-digest = H(A1) ":" nonce-value ":" H(A2) */
-	md5_init(&ctx);
+	md5_init_rs(&ctx);
 	md5_append(&ctx, (md5_byte_t*)a1buf, strlen(a1buf));
 	md5_append(&ctx, (md5_byte_t*)":", 1);
 	md5_append(&ctx, (md5_byte_t*)nonce, strlen(nonce));

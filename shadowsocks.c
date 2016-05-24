@@ -25,8 +25,6 @@
 #include "encrypt.h"
 #include "shadowsocks.h"
 
-#define INITIAL_BUFFER_SIZE 8192
-
 typedef enum ss_state_t {
     ss_new,
     ss_connected,
@@ -36,10 +34,11 @@ typedef enum ss_state_t {
 typedef struct ss_client_t {
     struct enc_ctx e_ctx;
     struct enc_ctx d_ctx;
+    short e_ctx_init;
+    short d_ctx_init;
 } ss_client;
 
 typedef struct ss_instance_t {
-    int init;
     int method; 
     enc_info info;
 } ss_instance;
@@ -63,21 +62,21 @@ int ss_is_valid_cred(const char *method, const char *password)
 
 static void ss_client_init(redsocks_client *client)
 {
-    ss_client *sclient = (void*)(client + 1);
-    ss_instance * ss = (ss_instance *)(client->instance+1);
-
     client->state = ss_new;
-    if (enc_ctx_init(&ss->info, &sclient->e_ctx, 1))
-        log_error(LOG_ERR, "Shadowsocks failed to initialize encryption context.");
-    if (enc_ctx_init(&ss->info, &sclient->d_ctx, 0))
-        log_error(LOG_ERR, "Shadowsocks failed to initialize decryption context.");
 }
 
 static void ss_client_fini(redsocks_client *client)
 {
     ss_client *sclient = (void*)(client + 1);
-    enc_ctx_free(&sclient->e_ctx);
-    enc_ctx_free(&sclient->d_ctx);
+
+    if (sclient->e_ctx_init) {
+        enc_ctx_free(&sclient->e_ctx);
+        sclient->e_ctx_init = 0;
+    }
+    if (sclient->d_ctx_init) {
+        enc_ctx_free(&sclient->d_ctx);
+        sclient->d_ctx_init = 0;
+    }
 }
 
 static void encrypt_mem(redsocks_client * client,
@@ -275,6 +274,8 @@ static void ss_relay_readcb(struct bufferevent *buffev, void *_arg)
 static void ss_relay_connected(struct bufferevent *buffev, void *_arg)
 {
     redsocks_client *client = _arg;
+    ss_client *sclient = (void*)(client + 1);
+    ss_instance * ss = (ss_instance *)(client->instance+1);
     ss_header_ipv4 header;
     size_t len = 0;
 
@@ -289,28 +290,37 @@ static void ss_relay_connected(struct bufferevent *buffev, void *_arg)
     }
 
     client->relay_connected = 1;
+    client->state = ss_connected; 
+
+    if (enc_ctx_init(&ss->info, &sclient->e_ctx, 1)) {
+        log_error(LOG_ERR, "Shadowsocks failed to initialize encryption context.");
+        redsocks_drop_client(client);
+        return;
+    }
+    sclient->e_ctx_init = 1;  
+    if (enc_ctx_init(&ss->info, &sclient->d_ctx, 0)) {
+        log_error(LOG_ERR, "Shadowsocks failed to initialize decryption context.");
+        redsocks_drop_client(client);
+        return;
+    }
+    sclient->e_ctx_init = 1;
+
     /* We do not need to detect timeouts any more.
     The two peers will handle it. */
     bufferevent_set_timeouts(client->relay, NULL, NULL);
 
-    if (!redsocks_start_relay(client))
-    {
-        /* overwrite theread callback to my function */
-        bufferevent_setcb(client->client, ss_client_readcb,
-                                         ss_client_writecb,
-                                         redsocks_event_error,
-                                         client);
-        bufferevent_setcb(client->relay, ss_relay_readcb,
-                                         ss_relay_writecb,
-                                         redsocks_event_error,
-                                         client);
-    }
-    else
-    {
-        redsocks_log_error(client, LOG_DEBUG, "failed to start relay");
-        redsocks_drop_client(client);
+    if (redsocks_start_relay(client))
+        // redsocks_start_relay() drops client on failure
         return;
-    }
+    /* overwrite theread callback to my function */
+    bufferevent_setcb(client->client, ss_client_readcb,
+                                     ss_client_writecb,
+                                     redsocks_event_error,
+                                     client);
+    bufferevent_setcb(client->relay, ss_relay_readcb,
+                                     ss_relay_writecb,
+                                     redsocks_event_error,
+                                     client);
 
     /* build and send header */
     // TODO: Better implementation and IPv6 Support
@@ -319,8 +329,6 @@ static void ss_relay_connected(struct bufferevent *buffev, void *_arg)
     header.port = client->destaddr.sin_port;
     len += sizeof(header);
     encrypt_mem(client, (char *)&header, len, client->relay, 0);
-
-    client->state = ss_connected; 
 
     // Write any data received from client side to relay.
     if (evbuffer_get_length(bufferevent_get_input(client->client)))
@@ -336,16 +344,11 @@ static int ss_connect_relay(redsocks_client *client)
 
     tv.tv_sec = client->instance->config.timeout;
     tv.tv_usec = 0;
-    /* use default timeout if timeout is not configured */
-    if (tv.tv_sec == 0)
-        tv.tv_sec = DEFAULT_CONNECT_TIMEOUT; 
-    
     client->relay = red_connect_relay2(&client->instance->config.relayaddr,
                     NULL, ss_relay_connected, redsocks_event_error, client, 
                     &tv);
 
     if (!client->relay) {
-        redsocks_log_errno(client, LOG_ERR, "ss_connect_relay");
         redsocks_drop_client(client);
         return -1;
     }
@@ -356,6 +359,7 @@ static int ss_instance_init(struct redsocks_instance_t *instance)
 {
     ss_instance * ss = (ss_instance *)(instance+1);
     const redsocks_config *config = &instance->config;
+    char buf1[RED_INET_ADDRSTRLEN];
 
     int valid_cred =  ss_is_valid_cred(config->login, config->password);
     if (!valid_cred 
@@ -366,7 +370,10 @@ static int ss_instance_init(struct redsocks_instance_t *instance)
     }
     else
     {
-        log_error(LOG_INFO, "using encryption method: %s", config->login);
+        log_error(LOG_INFO, "%s @ %s: encryption method: %s",
+            instance->relay_ss->name,
+            red_inet_ntop(&instance->config.bindaddr, buf1, sizeof(buf1)),
+            config->login);
     }
     return 0;
 }

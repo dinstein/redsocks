@@ -24,12 +24,10 @@
 #include <arpa/inet.h>
 #include "main.h"
 #include "log.h"
+#include "base.h"
 #include "utils.h"
 #include "redsocks.h" // for redsocks_close
-
-#ifndef IP_ORIGDSTADDR
-#define IP_ORIGDSTADDR 20
-#endif
+#include "libc-compat.h"
 
 int red_recv_udp_pkt(int fd, char *buf, size_t buflen, struct sockaddr_in *inaddr, struct sockaddr_in *toaddr)
 {
@@ -64,8 +62,6 @@ int red_recv_udp_pkt(int fd, char *buf, size_t buflen, struct sockaddr_in *inadd
                 cmsg->cmsg_len >= CMSG_LEN(sizeof(*toaddr))
             ) {
                 struct sockaddr_in* cmsgaddr = (struct sockaddr_in*)CMSG_DATA(cmsg);
-                //char buf[RED_INET_ADDRSTRLEN];
-                //log_error(LOG_DEBUG, "IP_ORIGDSTADDR: %s", red_inet_ntop(cmsgaddr, buf, sizeof(buf)));
                 memcpy(toaddr, cmsgaddr, sizeof(*toaddr));
             }
             else {
@@ -94,6 +90,13 @@ int red_recv_udp_pkt(int fd, char *buf, size_t buflen, struct sockaddr_in *inadd
     return pktlen;
 }
 
+uint32_t red_randui32()
+{
+	uint32_t ret;
+	evutil_secure_rng_get_bytes(&ret, sizeof(ret));
+	return ret;
+}
+
 time_t redsocks_time(time_t *t)
 {
     time_t retval;
@@ -120,11 +123,10 @@ struct bufferevent* red_connect_relay_if(const char *ifname,
                                 void *cbarg)
 {
     struct bufferevent *retval = NULL;
-    int on = 1;
     int relay_fd = -1;
     int error;
 
-    relay_fd = socket(AF_INET, SOCK_STREAM, 0);
+    relay_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (relay_fd == -1) {
         log_errno(LOG_ERR, "socket");
         goto fail;
@@ -140,13 +142,7 @@ struct bufferevent* red_connect_relay_if(const char *ifname,
 
     error = evutil_make_socket_nonblocking(relay_fd);
     if (error) {
-        log_errno(LOG_ERR, "fcntl");
-        goto fail;
-    }
-
-    error = setsockopt(relay_fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
-    if (error) {
-        log_errno(LOG_WARNING, "setsockopt");
+        log_errno(LOG_ERR, "evutil_make_socket_nonblocking");
         goto fail;
     }
 
@@ -163,21 +159,26 @@ struct bufferevent* red_connect_relay_if(const char *ifname,
         goto fail;
     }
 
+    if (apply_tcp_keepalive(relay_fd))
+        goto fail;
+
 //  error = bufferevent_socket_connect(retval, (struct sockaddr*)addr, sizeof(*addr));
 //  if (error) {
     error = connect(relay_fd, (struct sockaddr*)addr, sizeof(*addr));
     if (error && errno != EINPROGRESS) {
-        log_errno(LOG_NOTICE, "bufferevent_socket_connect");
+        log_errno(LOG_NOTICE, "connect");
         goto fail;
     }
 
     return retval;
 
 fail:
+    if (retval){
+        bufferevent_disable(retval, EV_READ|EV_WRITE);
+        bufferevent_free(retval);
+    }
     if (relay_fd != -1)
         redsocks_close(relay_fd);
-    if (retval)
-        bufferevent_free(retval);
     return NULL;
 }
 
@@ -200,11 +201,10 @@ struct bufferevent* red_connect_relay2(struct sockaddr_in *addr,
                                     const struct timeval *timeout_write)
 {
     struct bufferevent *retval = NULL;
-    int on = 1;
     int relay_fd = -1;
     int error;
 
-    relay_fd = socket(AF_INET, SOCK_STREAM, 0);
+    relay_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (relay_fd == -1) {
         log_errno(LOG_ERR, "socket");
         goto fail;
@@ -212,13 +212,7 @@ struct bufferevent* red_connect_relay2(struct sockaddr_in *addr,
 
     error = evutil_make_socket_nonblocking(relay_fd);
     if (error) {
-        log_errno(LOG_ERR, "fcntl");
-        goto fail;
-    }
-
-    error = setsockopt(relay_fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
-    if (error) {
-        log_errno(LOG_WARNING, "setsockopt");
+        log_errno(LOG_ERR, "evutil_make_socket_nonblocking");
         goto fail;
     }
 
@@ -237,21 +231,26 @@ struct bufferevent* red_connect_relay2(struct sockaddr_in *addr,
     }
     bufferevent_set_timeouts(retval, NULL, timeout_write);
 
+    if (apply_tcp_keepalive(relay_fd))
+        goto fail;
+
 //  error = bufferevent_socket_connect(retval, (struct sockaddr*)addr, sizeof(*addr));
 //  if (error) {
     error = connect(relay_fd, (struct sockaddr*)addr, sizeof(*addr));
     if (error && errno != EINPROGRESS) {
-        log_errno(LOG_NOTICE, "bufferevent_socket_connect");
+        log_errno(LOG_NOTICE, "connect");
         goto fail;
     }
 
     return retval;
 
 fail:
+    if (retval) {
+        bufferevent_disable(retval, EV_READ|EV_WRITE);
+        bufferevent_free(retval);
+    }
     if (relay_fd != -1)
         redsocks_close(relay_fd);
-    if (retval)
-        bufferevent_free(retval);
     return NULL;
 }
 
@@ -261,9 +260,9 @@ int red_socket_geterrno(struct bufferevent *buffev)
     int pseudo_errno;
     socklen_t optlen = sizeof(pseudo_errno);
 
-    assert(EVENT_FD(&buffev->ev_read) == EVENT_FD(&buffev->ev_write));
+    assert(event_get_fd(&buffev->ev_read) == event_get_fd(&buffev->ev_write));
 
-    error = getsockopt(EVENT_FD(&buffev->ev_read), SOL_SOCKET, SO_ERROR, &pseudo_errno, &optlen);
+    error = getsockopt(event_get_fd(&buffev->ev_read), SOL_SOCKET, SO_ERROR, &pseudo_errno, &optlen);
     if (error) {
         log_errno(LOG_ERR, "getsockopt");
         return -1;
@@ -335,10 +334,10 @@ size_t copy_evbuffer(struct bufferevent * dst, const struct bufferevent * src, s
     maxlen = EVBUFFER_LENGTH(src->input) - skip> maxlen?maxlen: EVBUFFER_LENGTH(src->input)-skip;
 
     n = evbuffer_peek(src->input, maxlen+skip, NULL, NULL, 0);
-    if (n>sizeof(quick_v)/sizeof(struct evbuffer_iovec))
+    if (n > sizeof(quick_v)/sizeof(struct evbuffer_iovec))
         v = malloc(sizeof(struct evbuffer_iovec)*n);
     else
-        v = quick_v;
+        v = &quick_v[0];
     n = evbuffer_peek(src->input, maxlen+skip, NULL, v, n);
     for (i=0; i<n; ++i) {
         size_t len = v[i].iov_len;
@@ -361,7 +360,7 @@ size_t copy_evbuffer(struct bufferevent * dst, const struct bufferevent * src, s
         * us over the limit. */
         written += len;
     }
-    if (n>sizeof(quick_v)/sizeof(struct evbuffer_iovec))
+    if (v != &quick_v[0])
         free(v);
     return written;
 }

@@ -65,7 +65,7 @@ typedef struct redsocks_client_t {
 	struct sockaddr_in  clientaddr;
 	struct sockaddr_in  destaddr;
 	int                 state;         // it's used by bottom layer
-	int                 relay_connected;
+	short               relay_connected;
 	unsigned short      client_evshut;
 	unsigned short      relay_evshut;
 	time_t              first_event;
@@ -78,7 +78,7 @@ void redsocks_touch_client(redsocks_client *client);
 int  redsocks_connect_relay(redsocks_client *client);
 int redsocks_start_relay(redsocks_client *client);
 void redsocks_dump_client(redsocks_client * client, int loglevel);
-void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int how);
+void redsocks_shutdown(redsocks_client *client, struct bufferevent *buffev, int how, int pseudo);
 
 typedef int (*size_comparator)(size_t a, size_t b);
 int sizes_equal(size_t a, size_t b);
